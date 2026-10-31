@@ -269,19 +269,18 @@
 | 磁盘 | 约 50 MB |
 | 其他 | 无需安装 Docker、Node.js 或 Go |
 
-> **目前仅验证 Windows**。仓库内保留有 macOS / Linux 的构建脚本与 CI 矩阵
-> （`.github/workflows/build.yml`，默认被 `.gitignore` 忽略），但**尚未实际验证
-> 运行效果**，相关平台的代码分支不在本项目的维护范围内。
+> 桌面分发目标为 Windows x64。GitHub Actions 在 Linux 上检查前端与 Rust
+> 核心，在 Windows 上生成并检查安装包；macOS / Linux 桌面安装包不在发布范围内。
 
 ### 安装方式一：安装包（推荐）
 
-从 [Releases](https://github.com/momo0410/workbuddy-switch-gateway/releases/latest) 下载：
+从 [Releases](https://github.com/minyoad/workbuddy-switch-gateway/releases/latest) 下载：
 
 | 文件 | 说明 |
 |---|---|
 | `WorkBuddy_Switch_Gateway_<版本>_x64-setup.exe` | 安装向导，自动创建开始菜单与卸载项 |
-| `WorkBuddy_Switch_Gateway_<版本>_x64_en-US.msi` | MSI 包，适合批量部署 |
-| `WorkBuddy_Switch_Gateway_<版本>_portable.zip` | 免安装版，解压即用，不写入注册表 |
+| `WorkBuddy_Switch_Gateway_<版本>_x64.msi` | MSI 包，适合批量部署 |
+| `WorkBuddy_Switch_Gateway_<版本>_x64_portable.zip` | 免安装版，解压即用 |
 
 ### 安装方式二：免安装
 
@@ -291,12 +290,14 @@
 
 ### 安装方式三：从源码构建
 
-需要 Go ≥ 1.22、Node.js ≥ 16、Rust 工具链（MSVC 或 MinGW 均可）。
+需要 Go（版本以网关 `go.mod` 为准）、Node.js 24、Rust stable MSVC 工具链、
+Visual Studio C++ 构建工具，以及 PowerShell 7。
 
 ```powershell
 # 1) 构建网关（Go），产物直接作为内嵌资源
-git clone --depth 1 https://github.com/Sliverkiss/workbuddy2api.git
+git clone https://github.com/HanawaBanana/workbuddy2api.git
 cd workbuddy2api
+git checkout cfb1713fb9f0692aa19aae7e7a6d6c2453235a38
 
 #    应用「国际版支持」补丁（需要国际版时才要；只做国服可跳过）
 git apply ..\workbuddy-switch-gateway\patches\intl-support.patch
@@ -309,10 +310,38 @@ go build -trimpath -ldflags "-s -w" `
 cd ..\workbuddy-switch-gateway
 .\scripts\build-single.ps1        # 产出 dist-single\wb-switch.exe
 
-# 3) 生成安装包（可选）
-npm install
-npm run tauri build
+# 3) 生成桌面 NSIS、MSI 和免安装 ZIP（与上面的 Web UI 单文件程序不同）
+.\scripts\build-windows.ps1 -GatewaySource .\crates\wb-switch-core\embedded\gateway.exe
 ```
+
+### GitHub Actions 自动构建与发布
+
+工作流位于 [`.github/workflows/release.yml`](.github/workflows/release.yml)：
+
+- PR：前端类型检查与构建、补丁后 Go 网关测试与编译、Rust 核心测试、
+  HTTP 服务编译与内嵌网关释放检查。
+- 推送 `main` 或手动运行：完成上述检查后，在 Windows runner 编译内嵌网关与
+  桌面应用，生成 NSIS、MSI、免安装 ZIP 和 `SHA256SUMS.txt`，上传 Actions artifacts。
+- 推送 `v<版本号>` 标签：所有构建与安装包检查通过后，自动创建 GitHub Release
+  并上传上述文件。标签必须匹配 `package.json`、Tauri 和 Cargo 中的版本。
+
+网关源码默认为 `HanawaBanana/workbuddy2api` 的固定提交
+`cfb1713fb9f0692aa19aae7e7a6d6c2453235a38`，并应用仓库内的
+`patches/intl-support.patch`，已验证补丁可干净应用。固定该提交是为了保留与应用
+一致的账号、配置与调度接口；该 fork 的最新分支不能直接应用现有补丁。
+如需切换源码，可在仓库 Settings → Secrets and variables → Actions → Variables
+配置 `GATEWAY_REPOSITORY`（`owner/repo`）和 `GATEWAY_REF`（固定提交）。
+源码须与补丁兼容；工作流会检查补丁应用和 Go 依赖校验，失败时停止发布。
+当前 checkout 步骤适用于公开网关源码；私有 fork 还需要另行配置跨仓库读取权限。
+
+产物输出到 `dist-single/`。免安装 ZIP 包含桌面主程序、`WebView2Loader.dll`
+和说明文件，网关内嵌于主程序。免安装版仍需 WebView2 Runtime，账号与配置仍写入
+用户目录 `~/.wb-switch`，并非目录隔离模式。CI 会解压 ZIP、执行 NSIS 静默安装、
+检查桌面主窗口启动及 MSI 管理解包，再校验产物 SHA-256。
+
+普通安装包不需要上游维护者的更新签名私钥：构建脚本关闭 `createUpdaterArtifacts`，
+不生成自动更新签名文件。本工作流不配置 Windows 代码签名或应用内自动更新；
+新版本通过本仓库 Releases 手动下载。
 
 ---
 

@@ -1,4 +1,4 @@
-export const GITHUB_OWNER = "momo0410";
+export const GITHUB_OWNER = "minyoad";
 export const GITHUB_REPO = "workbuddy-switch-gateway";
 export const GITHUB_REPOSITORY_URL = `https://github.com/${GITHUB_OWNER}/${GITHUB_REPO}`;
 export const GITHUB_RELEASE_URL = `${GITHUB_REPOSITORY_URL}/releases/latest`;

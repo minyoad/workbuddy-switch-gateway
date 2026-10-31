@@ -20,7 +20,7 @@ use crate::modules::config::{
 /// 应用当前版本（来自 Cargo.toml package.version）。
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// 本整合版仓库所有者（与上游 changexbc/workbuddy-switch 区分开）。
-pub const GITHUB_OWNER: &str = "momo0410";
+pub const GITHUB_OWNER: &str = "minyoad";
 pub const GITHUB_REPO: &str = "workbuddy-switch-gateway";
 
 /// 成功结果缓存有效期（6 小时）。自动轮询（30 分钟）命中缓存，不发网络请求；
@@ -68,7 +68,10 @@ pub fn load_github_config() -> Value {
     }
     // 历史配置可能指向上游仓库（changexbc/workbuddy-switch 或 changexbc/wb-switch）；
     // 迁到本仓库，避免把用户更新成上游版本而丢失网关功能。
-    if owner == "changexbc" && (repo == "wb-switch" || repo == "workbuddy-switch") {
+    if (owner == "changexbc" && (repo == "wb-switch" || repo == "workbuddy-switch"))
+        || (owner == "momo0410" && repo == GITHUB_REPO)
+    {
+        owner = GITHUB_OWNER.to_string();
         repo = GITHUB_REPO.to_string();
         should_normalize = true;
     }

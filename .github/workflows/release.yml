@@ -1,0 +1,201 @@
+name: Build and release
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  GATEWAY_REPOSITORY: ${{ vars.GATEWAY_REPOSITORY || 'HanawaBanana/workbuddy2api' }}
+  GATEWAY_REF: ${{ vars.GATEWAY_REF || 'cfb1713fb9f0692aa19aae7e7a6d6c2453235a38' }}
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install locked frontend dependencies
+        run: npm ci --registry=https://registry.npmjs.org --replace-registry-host=always --no-audit --no-fund
+      - run: npm run build
+      - name: Checkout gateway source
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.GATEWAY_REPOSITORY }}
+          ref: ${{ env.GATEWAY_REF }}
+          path: .build/gateway
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: .build/gateway/go.mod
+          cache-dependency-path: .build/gateway/go.sum
+      - name: Test and compile patched gateway
+        working-directory: .build/gateway
+        run: |
+          git apply --check ../../patches/intl-support.patch
+          git apply ../../patches/intl-support.patch
+          go mod verify
+          go test -mod=readonly ./...
+          go build -mod=readonly -trimpath -ldflags '-s -w' -o "$RUNNER_TEMP/gateway" ./cmd/server
+          echo "WB_SWITCH_GATEWAY_BIN=$RUNNER_TEMP/gateway" >> "$GITHUB_ENV"
+      - run: cargo test --locked -p wb-switch-core
+      - run: cargo build --locked -p wb-switch-server
+      - name: Smoke test HTTP service
+        shell: bash
+        run: |
+          env -u WB_SWITCH_GATEWAY_BIN target/debug/wb-switch serve --no-open --port 57890 > "$RUNNER_TEMP/wb-server.log" 2>&1 &
+          server_pid=$!
+          trap 'kill "$server_pid" 2>/dev/null || true' EXIT
+          curl --fail --retry 15 --retry-delay 1 --retry-connrefused http://127.0.0.1:57890/ -o "$RUNNER_TEMP/index.html"
+          python3 - <<'PY'
+          import json, urllib.request
+          status = json.load(urllib.request.urlopen('http://127.0.0.1:57890/api/status'))
+          accounts = json.load(urllib.request.urlopen('http://127.0.0.1:57890/api/accounts'))
+          gateway = json.load(urllib.request.urlopen('http://127.0.0.1:57890/api/gateway/status'))
+          assert status['version']
+          assert isinstance(accounts['accounts'], list)
+          assert gateway['exeFound'] and gateway['exeSource'] == 'embedded'
+          PY
+
+  windows:
+    needs: validate
+    if: github.event_name != 'pull_request'
+    runs-on: windows-2022
+    timeout-minutes: 60
+    steps:
+      - name: Preserve LF for gateway patches
+        run: git config --global core.autocrlf false
+      - uses: actions/checkout@v4
+      - name: Check tag and package versions
+        shell: pwsh
+        run: |
+          $version = (Get-Content package.json -Raw | ConvertFrom-Json).version
+          $tauriVersion = (Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
+          if ($version -ne $tauriVersion) { throw 'package.json 与 Tauri 版本不一致' }
+          foreach ($manifest in @('src-tauri/Cargo.toml', 'crates/wb-switch-core/Cargo.toml', 'crates/wb-switch-server/Cargo.toml')) {
+            $cargoVersion = [regex]::Match((Get-Content $manifest -Raw), '(?m)^version\s*=\s*"([^"]+)"').Groups[1].Value
+            if ($cargoVersion -ne $version) { throw "$manifest 版本不一致" }
+          }
+          if ($env:GITHUB_REF_TYPE -eq 'tag' -and $env:GITHUB_REF_NAME -ne "v$version") {
+            throw "发布标签必须为 v$version"
+          }
+      - name: Checkout gateway source
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.GATEWAY_REPOSITORY }}
+          ref: ${{ env.GATEWAY_REF }}
+          path: .build/gateway
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: .build/gateway/go.mod
+          cache-dependency-path: .build/gateway/go.sum
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@v2
+      - name: Apply gateway patch and compile
+        shell: pwsh
+        run: |
+          Push-Location .build/gateway
+          try {
+            git apply --check ../../patches/intl-support.patch
+            if ($LASTEXITCODE -ne 0) { throw '网关补丁无法应用，请检查 GATEWAY_REF' }
+            git apply ../../patches/intl-support.patch
+            if ($LASTEXITCODE -ne 0) { throw '应用网关补丁失败' }
+            go mod verify
+            if ($LASTEXITCODE -ne 0) { throw 'Go 依赖完整性校验失败' }
+            go build -mod=readonly -trimpath -ldflags '-s -w' -o gateway.exe ./cmd/server
+            if ($LASTEXITCODE -ne 0) { throw 'Go 网关编译失败' }
+          } finally { Pop-Location }
+      - name: Build installers and portable archive
+        shell: pwsh
+        run: ./scripts/build-windows.ps1 -GatewaySource .build/gateway/gateway.exe
+      - name: Verify portable archive
+        shell: pwsh
+        run: |
+          $zip = Get-ChildItem dist-single/*_portable.zip
+          Expand-Archive $zip.FullName -DestinationPath $env:RUNNER_TEMP/portable-check
+          foreach ($name in @('WorkBuddy-Switch-Gateway.exe', 'WebView2Loader.dll', '使用说明.txt')) {
+            if (-not (Test-Path "$env:RUNNER_TEMP/portable-check/$name")) { throw "便携版缺少 $name" }
+          }
+      - name: Smoke test portable desktop startup
+        shell: pwsh
+        run: |
+          $app = Start-Process "$env:RUNNER_TEMP/portable-check/WorkBuddy-Switch-Gateway.exe" -PassThru
+          try {
+            $ready = $false
+            for ($i = 0; $i -lt 60; $i++) {
+              Start-Sleep -Seconds 1
+              $app.Refresh()
+              if ($app.HasExited) { throw "桌面程序提前退出：$($app.ExitCode)" }
+              if ($app.MainWindowHandle -ne 0) { $ready = $true; break }
+            }
+            if (-not $ready) { throw '桌面主窗口未能在 60 秒内显示' }
+          } finally {
+            if (-not $app.HasExited) { Stop-Process -Id $app.Id -Force }
+          }
+      - name: Verify NSIS installation and MSI extraction
+        shell: pwsh
+        run: |
+          $setup = Get-ChildItem dist-single/*-setup.exe
+          $installDir = "$env:RUNNER_TEMP/nsis-check"
+          $process = Start-Process $setup.FullName -ArgumentList '/S', "/D=$installDir" -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw "NSIS 安装失败：$($process.ExitCode)" }
+          if (-not (Test-Path "$installDir/wb-switch-rust.exe")) { throw 'NSIS 安装后缺少主程序' }
+          $msi = Get-ChildItem dist-single/*.msi
+          $process = Start-Process msiexec.exe -ArgumentList '/a', "`"$($msi.FullName)`"", '/qn', "TARGETDIR=`"$env:RUNNER_TEMP/msi-check`"" -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw "MSI 解包失败：$($process.ExitCode)" }
+          if (-not (Get-ChildItem "$env:RUNNER_TEMP/msi-check" -Recurse -Filter wb-switch-rust.exe)) {
+            throw 'MSI 中缺少主程序'
+          }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-x64
+          path: |
+            dist-single/*-setup.exe
+            dist-single/*.msi
+            dist-single/*_portable.zip
+            dist-single/SHA256SUMS.txt
+          if-no-files-found: error
+
+  release:
+    needs: windows
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows-x64
+          path: release-assets
+      - name: Verify checksums
+        working-directory: release-assets
+        run: sha256sum --check SHA256SUMS.txt
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: gh release create "$RELEASE_TAG" release-assets/* --verify-tag --generate-notes --title "$RELEASE_TAG"

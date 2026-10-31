@@ -35,9 +35,8 @@ try {
         if (-not (Test-Path $gwDir)) {
             throw "未找到网关源码目录 $gwDir；可用 -GatewaySource 指定已有的 gateway.exe"
         }
-        $env:GOFLAGS = "-mod=mod"
         Push-Location $gwDir
-        go build -trimpath -ldflags "-s -w" -o (Join-Path $embedded "gateway.exe") ./cmd/server
+        go build -mod=readonly -trimpath -ldflags "-s -w" -o (Join-Path $embedded "gateway.exe") ./cmd/server
         $code = $LASTEXITCODE
         Pop-Location
         if ($code -ne 0) { throw "网关构建失败" }
@@ -48,7 +47,10 @@ try {
     Write-Host "==> [2/4] 构建前端" -ForegroundColor Cyan
     if (-not $SkipFrontend) {
         Push-Location $root   # 前端源码与输出目录（dist/）都在仓库根
-        if (-not (Test-Path node_modules)) { npm install --no-audit --no-fund }
+        if (-not (Test-Path node_modules)) {
+            npm ci --registry=https://registry.npmjs.org --replace-registry-host=always --no-audit --no-fund
+            if ($LASTEXITCODE -ne 0) { throw "依赖安装失败" }
+        }
         npm run build
         $code = $LASTEXITCODE
         Pop-Location
@@ -59,7 +61,7 @@ try {
 
     # ---- 3) Rust 编译（内嵌网关 + 前端）----
     Write-Host "==> [3/4] 编译 Rust 主体" -ForegroundColor Cyan
-    cargo build -p wb-switch-server --release
+    cargo build --locked -p wb-switch-server --release
     if ($LASTEXITCODE -ne 0) { throw "Rust 构建失败" }
 
     # ---- 4) 输出 ----
