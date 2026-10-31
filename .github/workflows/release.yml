@@ -154,21 +154,41 @@ jobs:
           } finally {
             if (-not $app.HasExited) { Stop-Process -Id $app.Id -Force }
           }
-      - name: Verify NSIS installation and MSI extraction
+      - name: Verify NSIS installation
         shell: pwsh
         run: |
-          $setup = Get-ChildItem dist-single/*-setup.exe
-          $installDir = "$env:RUNNER_TEMP/nsis-check"
-          $process = Start-Process $setup.FullName -ArgumentList '/S', "/D=$installDir" -Wait -PassThru
-          if ($process.ExitCode -ne 0) { throw "NSIS 安装失败：$($process.ExitCode)" }
-          if (-not (Test-Path "$installDir/wb-switch-rust.exe")) { throw 'NSIS 安装后缺少主程序' }
-          $msi = Get-ChildItem dist-single/*.msi
-          $process = Start-Process msiexec.exe -ArgumentList '/a', "`"$($msi.FullName)`"", '/qn', "TARGETDIR=`"$env:RUNNER_TEMP/msi-check`"" -Wait -PassThru
-          if ($process.ExitCode -ne 0) { throw "MSI 解包失败：$($process.ExitCode)" }
-          if (-not (Get-ChildItem "$env:RUNNER_TEMP/msi-check" -Recurse -Filter wb-switch-rust.exe)) {
-            throw 'MSI 中缺少主程序'
+          try {
+            $setup = Get-ChildItem dist-single/*-setup.exe
+            $installDir = "$env:RUNNER_TEMP/nsis-check"
+            $process = Start-Process $setup.FullName -ArgumentList '/S', "/D=$installDir" -Wait -PassThru
+            if ($process.ExitCode -ne 0) { throw "NSIS 安装失败：退出码 $($process.ExitCode)" }
+            if (-not (Test-Path "$installDir/wb-switch-rust.exe")) {
+              $files = (Get-ChildItem $installDir -Recurse -ErrorAction SilentlyContinue).FullName -join '; '
+              throw "NSIS 安装后缺少主程序。安装目录内容：$files"
+            }
+          } catch {
+            Write-Output "::error::$($_.Exception.Message)"
+            throw
+          }
+      - name: Verify MSI extraction
+        shell: pwsh
+        run: |
+          try {
+            $msi = Get-ChildItem dist-single/*.msi
+            $process = Start-Process msiexec.exe -ArgumentList '/a', "`"$($msi.FullName)`"", '/qn', "TARGETDIR=`"$env:RUNNER_TEMP/msi-check`"", '/L*v', "`"$env:RUNNER_TEMP/msi-check.log`"" -Wait -PassThru
+            if ($process.ExitCode -ne 0) { throw "MSI 解包失败：退出码 $($process.ExitCode)" }
+            if (-not (Get-ChildItem "$env:RUNNER_TEMP/msi-check" -Recurse -Filter wb-switch-rust.exe)) {
+              throw 'MSI 中缺少主程序'
+            }
+          } catch {
+            Write-Output "::error::$($_.Exception.Message)"
+            if (Test-Path "$env:RUNNER_TEMP/msi-check.log") {
+              Get-Content "$env:RUNNER_TEMP/msi-check.log" -Tail 60
+            }
+            throw
           }
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: windows-x64
           path: |
