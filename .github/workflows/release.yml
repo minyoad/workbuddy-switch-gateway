@@ -130,6 +130,39 @@ jobs:
       - name: Build installers and portable archive
         shell: pwsh
         run: ./scripts/build-windows.ps1 -GatewaySource .build/gateway/gateway.exe
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: windows-x64
+          path: |
+            dist-single/*-setup.exe
+            dist-single/*.msi
+            dist-single/*_portable.zip
+            dist-single/SHA256SUMS.txt
+          if-no-files-found: error
+
+  windows-checks:
+    needs: windows
+    runs-on: windows-2022
+    timeout-minutes: 15
+    steps:
+      - uses: actions/download-artifact@v4
+        id: artifacts
+        with:
+          name: windows-x64
+          path: dist-single
+      - name: Verify artifact checksums
+        shell: pwsh
+        run: |
+          foreach ($line in Get-Content dist-single/SHA256SUMS.txt) {
+            if ($line -match '^([0-9a-f]{64})  (.+)$') {
+              $expected = $Matches[1]
+              $file = Join-Path 'dist-single' $Matches[2]
+              if ((Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash.ToLowerInvariant() -ne $expected) {
+                throw "SHA-256 校验失败：$file"
+              }
+            } else { throw "无效的校验文件行：$line" }
+          }
       - name: Verify portable archive
         shell: pwsh
         run: |
@@ -152,16 +185,22 @@ jobs:
             }
             if (-not $ready) { throw '桌面主窗口未能在 60 秒内显示' }
           } finally {
-            if (-not $app.HasExited) { Stop-Process -Id $app.Id -Force }
+            if (-not $app.HasExited) {
+              Stop-Process -Id $app.Id -Force
+              if (-not $app.WaitForExit(10000)) { throw '便携版进程未能退出' }
+            }
           }
       - name: Verify NSIS installation
         shell: pwsh
         run: |
           try {
             $setup = Get-ChildItem dist-single/*-setup.exe
-            $installDir = "$env:RUNNER_TEMP/nsis-check"
-            $process = Start-Process $setup.FullName -ArgumentList '/S', "/D=$installDir" -Wait -PassThru
+            # 按默认安装路径测试，避免 /D 参数的路径解析影响安装目录断言。
+            $process = Start-Process $setup.FullName -ArgumentList '/S' -Wait -PassThru
             if ($process.ExitCode -ne 0) { throw "NSIS 安装失败：退出码 $($process.ExitCode)" }
+            $key = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\WorkBuddy Switch Gateway'
+            $installDir = (Get-ItemProperty -LiteralPath $key -Name InstallLocation).InstallLocation.Trim('"')
+            if (-not $installDir) { throw 'NSIS 安装后未登记安装目录' }
             if (-not (Test-Path "$installDir/wb-switch-rust.exe")) {
               $files = (Get-ChildItem $installDir -Recurse -ErrorAction SilentlyContinue).FullName -join '; '
               throw "NSIS 安装后缺少主程序。安装目录内容：$files"
@@ -171,13 +210,16 @@ jobs:
             throw
           }
       - name: Verify MSI extraction
+        if: ${{ !cancelled() && steps.artifacts.outcome == 'success' }}
         shell: pwsh
         run: |
           try {
             $msi = Get-ChildItem dist-single/*.msi
-            $process = Start-Process msiexec.exe -ArgumentList '/a', "`"$($msi.FullName)`"", '/qn', "TARGETDIR=`"$env:RUNNER_TEMP/msi-check`"", '/L*v', "`"$env:RUNNER_TEMP/msi-check.log`"" -Wait -PassThru
+            $extractDir = Join-Path $env:RUNNER_TEMP 'msi-check'
+            $logPath = Join-Path $env:RUNNER_TEMP 'msi-check.log'
+            $process = Start-Process msiexec.exe -ArgumentList '/a', "`"$($msi.FullName)`"", '/qn', "TARGETDIR=`"$extractDir`"", '/L*v', "`"$logPath`"" -Wait -PassThru
             if ($process.ExitCode -ne 0) { throw "MSI 解包失败：退出码 $($process.ExitCode)" }
-            if (-not (Get-ChildItem "$env:RUNNER_TEMP/msi-check" -Recurse -Filter wb-switch-rust.exe)) {
+            if (-not (Get-ChildItem $extractDir -Recurse -Filter wb-switch-rust.exe)) {
               throw 'MSI 中缺少主程序'
             }
           } catch {
@@ -187,19 +229,9 @@ jobs:
             }
             throw
           }
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: windows-x64
-          path: |
-            dist-single/*-setup.exe
-            dist-single/*.msi
-            dist-single/*_portable.zip
-            dist-single/SHA256SUMS.txt
-          if-no-files-found: error
 
   release:
-    needs: windows
+    needs: windows-checks
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-24.04
     timeout-minutes: 10
