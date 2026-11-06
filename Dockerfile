@@ -69,8 +69,9 @@ WORKDIR /app
 # 先拷 manifest 以利用层缓存（依赖不变时不重复解析）
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
-# src-tauri 仅需 manifest：满足 workspace 成员解析，但不会编译桌面端
-COPY src-tauri/Cargo.toml ./src-tauri/Cargo.toml
+# 容器构建只含 server/core：从 workspace 成员里剔除桌面端 src-tauri，
+# 否则 cargo 会因 src-tauri/src/lib.rs 缺失而拒绝解析整个 workspace
+RUN sed -i 's/, "src-tauri"//' Cargo.toml
 
 COPY --from=web /app/dist ./dist
 COPY --from=gateway /out/gateway /build/gateway

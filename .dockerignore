@@ -13,9 +13,8 @@ target
 dist
 **/target
 
-# 桌面版专属（仅保留 workspace manifest 以满足 cargo 元数据解析）
-src-tauri/*
-!src-tauri/Cargo.toml
+# 桌面版专属：容器构建不需要（workspace 成员由 Dockerfile 内 sed 剔除）
+src-tauri
 
 # 与镜像无关的目录
 docs
