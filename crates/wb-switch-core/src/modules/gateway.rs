@@ -188,6 +188,44 @@ fn read_existing_config() -> Option<Value> {
     serde_json::from_str::<Value>(&text).ok().filter(Value::is_object)
 }
 
+/// 前端 camelCase 字段 → 配置 snake_case 的别名表。
+///
+/// webui 的 `POST /api/gateway/config` 会把前端对象（`apiKey` / `autoStart` /
+/// `pinnedUid`）原样透传进来。若不归一化，配置里会同时存在两种键，而所有
+/// 读取方（包括写网关原生配置的 `write_native_config`）只认 snake_case，
+/// 表现为「点保存成功、刷新后 API Key 又变空」（Docker 远程部署反馈）。
+const CAMEL_ALIASES: [(&str, &str); 3] = [
+    ("apiKey", "api_key"),
+    ("autoStart", "auto_start"),
+    ("pinnedUid", "pinned_uid"),
+];
+
+/// 把 camelCase 别名折叠成 snake_case 并删除别名键。
+///
+/// 同时兼容历史脏数据：旧版本已把 `apiKey` 写进配置文件，这里在
+/// snake_case 缺失或为空时用别名值补齐，使老配置文件升级后也能读到密钥。
+fn normalize_camel_aliases(value: &Value) -> Value {
+    let mut out = value.clone();
+    if let Some(map) = out.as_object_mut() {
+        for (camel, snake) in CAMEL_ALIASES {
+            let camel_value = map.get(camel).cloned();
+            let snake_missing = map
+                .get(snake)
+                .map(|v| v.is_null() || v.as_str().is_some_and(str::is_empty))
+                .unwrap_or(true);
+            if let Some(v) = camel_value {
+                if snake_missing {
+                    map.insert(snake.to_string(), v);
+                }
+            }
+        }
+        for (camel, _) in CAMEL_ALIASES {
+            map.remove(camel);
+        }
+    }
+    out
+}
+
 /// 合并配置：以「默认值 < 磁盘现有配置 < 传入 patch」的顺序覆盖。
 ///
 /// 关键点：必须以**磁盘现有配置**为基准，而不是只用默认值。
@@ -195,11 +233,15 @@ fn read_existing_config() -> Option<Value> {
 /// listen / api_key 一起重置为默认值，导致界面与网关实际配置不一致
 ///（曾经因此让账号池查询带上空 api_key，前端显示异常）。
 fn merge_gateway_config(input: &Value) -> Value {
+    let input = normalize_camel_aliases(input);
     let base = match read_existing_config() {
-        Some(existing) => overlay(default_gateway_config(), &existing),
+        Some(existing) => overlay(
+            default_gateway_config(),
+            &normalize_camel_aliases(&existing),
+        ),
         None => default_gateway_config(),
     };
-    finalize_gateway_config(overlay(base, input))
+    finalize_gateway_config(overlay(base, &input))
 }
 
 /// 读取网关配置（缺字段自动补默认值）。
@@ -1195,6 +1237,43 @@ mod tests {
         assert_eq!(after_runtime["api_key"], "sk-user", "api_key 不应被运行态更新清空");
         assert_eq!(after_runtime["auto_start"], true, "自动启动设置不应丢失");
         assert_eq!(after_runtime["last_status"], "started");
+    }
+
+    #[test]
+    fn camel_case_patch_maps_to_snake_case() {
+        // webui 保存时传的是 camelCase；必须落到 snake_case 才算真正保存
+        let patch = super::normalize_camel_aliases(&json!({
+            "port": 7863,
+            "apiKey": "sk-webui",
+            "autoStart": true,
+            "pinnedUid": "uid-1",
+        }));
+        assert_eq!(patch["api_key"], "sk-webui");
+        assert_eq!(patch["auto_start"], true);
+        assert_eq!(patch["pinned_uid"], "uid-1");
+        assert!(patch.get("apiKey").is_none(), "别名键应被清除");
+        assert!(patch.get("autoStart").is_none());
+        assert!(patch.get("pinnedUid").is_none());
+    }
+
+    #[test]
+    fn legacy_camel_config_is_migrated() {
+        // 旧版本 webui 把密钥写成了 apiKey，读取时应迁移到 api_key
+        let migrated = super::normalize_camel_aliases(&json!({
+            "apiKey": "sk-legacy",
+            "api_key": "",
+            "autoStart": true,
+        }));
+        assert_eq!(migrated["api_key"], "sk-legacy");
+        assert_eq!(migrated["auto_start"], true);
+        assert!(migrated.get("apiKey").is_none());
+
+        // snake_case 已有值时不被别名覆盖
+        let kept = super::normalize_camel_aliases(&json!({
+            "apiKey": "sk-stale",
+            "api_key": "sk-real",
+        }));
+        assert_eq!(kept["api_key"], "sk-real");
     }
 
     #[test]
