@@ -69,6 +69,8 @@ WORKDIR /app
 # 先拷 manifest 以利用层缓存（依赖不变时不重复解析）
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
+# wb-switch-core 的 codebuddy_cli.rs 在编译期 include_str! 该文件
+COPY scripts/codebuddy-cli-helper.cjs ./scripts/codebuddy-cli-helper.cjs
 # 容器构建只含 server/core：从 workspace 成员里剔除桌面端 src-tauri，
 # 否则 cargo 会因 src-tauri/src/lib.rs 缺失而拒绝解析整个 workspace
 RUN sed -i 's/, "src-tauri"//' Cargo.toml

@@ -16,10 +16,11 @@ dist
 # 桌面版专属：容器构建不需要（workspace 成员由 Dockerfile 内 sed 剔除）
 src-tauri
 
-# 与镜像无关的目录
+# 与镜像无关的目录（scripts 中的 CLI helper 例外：被 codebuddy_cli.rs include_str! 内嵌）
 docs
 npm
-scripts
+scripts/*
+!scripts/codebuddy-cli-helper.cjs
 public/screenshots
 *.md
 !README.md

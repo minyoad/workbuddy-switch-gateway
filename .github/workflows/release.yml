@@ -250,7 +250,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           RELEASE_TAG: ${{ github.ref_name }}
-        run: gh release create "$RELEASE_TAG" release-assets/* --verify-tag --generate-notes --title "$RELEASE_TAG"
+        run: gh release create "$RELEASE_TAG" release-assets/* --verify-tag --generate-notes --title "$RELEASE_TAG" || gh release upload "$RELEASE_TAG" release-assets/* --clobber
 
   # 构建 Docker 镜像并发布到 GHCR（总是）与 Docker Hub（配置 secrets 后）。
   # 需要的仓库配置：
