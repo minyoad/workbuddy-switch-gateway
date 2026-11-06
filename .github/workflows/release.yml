@@ -251,3 +251,74 @@ jobs:
           GH_REPO: ${{ github.repository }}
           RELEASE_TAG: ${{ github.ref_name }}
         run: gh release create "$RELEASE_TAG" release-assets/* --verify-tag --generate-notes --title "$RELEASE_TAG"
+
+  # 构建 Docker 镜像并发布到 GHCR（总是）与 Docker Hub（配置 secrets 后）。
+  # 需要的仓库配置：
+  #   secrets.DOCKERHUB_USERNAME / secrets.DOCKERHUB_TOKEN  —— 可选，未配置则只推 GHCR
+  docker:
+    needs: validate
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compute image list (GHCR + optional Docker Hub)
+        id: images
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+        run: |
+          shopt -s inherit_errexit
+          set -e
+          images="ghcr.io/${GITHUB_REPOSITORY,,}"
+          if [ -n "$DOCKERHUB_USERNAME" ]; then
+            images="$images"$'\n'"docker.io/${DOCKERHUB_USERNAME,,}/workbuddy-switch-gateway"
+            echo "dh_enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "dh_enabled=false" >> "$GITHUB_OUTPUT"
+          fi
+          {
+            echo "images<<IMAGES_EOF"
+            echo "$images"
+            echo "IMAGES_EOF"
+            echo "gateway_repo_https=https://github.com/${GATEWAY_REPOSITORY}.git"
+          } >> "$GITHUB_OUTPUT"
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Login to Docker Hub
+        if: steps.images.outputs.dh_enabled == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: docker.io
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - uses: docker/setup-buildx-action@v3
+      - name: Docker meta
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.images.outputs.images }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+            type=sha,enable=${{ !startsWith(github.ref, 'refs/tags/v') }}
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            GATEWAY_REPO=${{ steps.images.outputs.gateway_repo_https }}
+            GATEWAY_REF=${{ env.GATEWAY_REF }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

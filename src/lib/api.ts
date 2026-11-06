@@ -43,9 +43,46 @@ import { screenshotDemoResponse } from "./screenshot-demo";
 /**
  * 双通道适配层：
  * - 桌面 App（Tauri）：`invoke` 调用 Rust commands
- * - webui（浏览器）：HTTP fetch 调用本地 workbuddy-switch 服务（127.0.0.1）
+ * - webui（浏览器）：HTTP fetch 调用本地/远程 workbuddy-switch 服务
+ *
+ * webui 页面由服务自身托管，因此默认同源访问（支持远程 Docker 部署）；
+ * 仅 vite dev（:1420）与桌面端回退到本机默认端口。
  */
-const API_BASE = "http://127.0.0.1:57890";
+const LOCAL_FALLBACK = "http://127.0.0.1:57890";
+const API_BASE = (() => {
+  // 桌面端（Tauri）与非 http 环境：始终走本机默认端口
+  if (
+    typeof window === "undefined" ||
+    "__TAURI_INTERNALS__" in window ||
+    (window.location?.protocol !== "http:" && window.location?.protocol !== "https:")
+  ) {
+    return LOCAL_FALLBACK;
+  }
+  // vite dev（:1420，无后端托管）：仍指向本机服务默认端口
+  if (window.location.port === "1420") return LOCAL_FALLBACK;
+  // 其余 http(s) 环境（含远程部署）：页面由服务自身托管，同源访问
+  return window.location.origin;
+})();
+
+const API_KEY_STORAGE = "wb_switch_api_key";
+
+/** 从 URL ?key= 参数或 localStorage 读取访问密钥；URL 读取后即从地址栏清除。 */
+function readApiKey(): string {
+  if (typeof window === "undefined") return "";
+  try {
+    const url = new URL(window.location.href);
+    const fromQuery = url.searchParams.get("key");
+    if (fromQuery) {
+      localStorage.setItem(API_KEY_STORAGE, fromQuery);
+      url.searchParams.delete("key");
+      window.history.replaceState(null, "", url.toString());
+      return fromQuery;
+    }
+    return localStorage.getItem(API_KEY_STORAGE) ?? "";
+  } catch {
+    return "";
+  }
+}
 
 const DEMO_READ_COMMANDS = new Set([
   "get_status", "get_accounts", "get_codebuddy_cli_status", "get_codebuddy_cn_ide_status", "get_checkin_status",
@@ -156,9 +193,13 @@ async function httpCall<T>(cmd: string, args?: Record<string, unknown>): Promise
       route.method === "GET"
         ? `${API_BASE}${route.path}${queryString(args)}`
         : `${API_BASE}${route.path}`;
+    const apiKey = readApiKey();
     res = await fetch(url, {
       method: route.method,
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+        ...(apiKey ? { "X-Api-Key": apiKey } : {}),
+      },
       body: route.method === "POST" ? JSON.stringify(args ?? {}) : undefined,
     });
   } catch {
@@ -166,6 +207,16 @@ async function httpCall<T>(cmd: string, args?: Record<string, unknown>): Promise
   }
   const data = await res.json().catch(() => ({}));
   if (!res.ok) {
+    if (res.status === 401) {
+      // 密钥失效/未提供：清除本地密钥，刷新后由服务端登录页重新输入
+      try {
+        localStorage.removeItem(API_KEY_STORAGE);
+        window.location.reload();
+      } catch {
+        /* ignore */
+      }
+      throw new Error("访问密钥无效，请重新输入");
+    }
     throw new Error(data.message || data.error || `请求失败 (${res.status})`);
   }
   return data as T;

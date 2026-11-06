@@ -2,10 +2,12 @@
 //!
 //! ```bash
 //! workbuddy-switch              # 启动本地服务 + 打开浏览器 webui
-//! workbuddy-switch serve        # 只起服务不开浏览器（--port / --no-open）
+//! workbuddy-switch serve        # 只起服务不开浏览器（--port / --host / --no-open）
 //! workbuddy-switch status       # 终端输出当前账号
 //! workbuddy-switch version      # 版本号
 //! ```
+//!
+//! 远程部署（Docker 等）：`--host 0.0.0.0` + 环境变量 `WB_SWITCH_API_KEY` 启用访问密钥。
 
 mod api;
 
@@ -123,13 +125,24 @@ async fn serve(args: &[String]) {
             port = p;
         }
     }
+    // 绑定地址：--host 参数优先，其次环境变量 WB_SWITCH_HOST，默认仍为本机回环。
+    // 远程部署（如 Docker）传 --host 0.0.0.0 让容器外可访问。
+    let mut host = std::env::var("WB_SWITCH_HOST")
+        .ok()
+        .filter(|h| !h.trim().is_empty())
+        .unwrap_or_else(|| "127.0.0.1".to_string());
+    if let Some(i) = args.iter().position(|a| a == "--host") {
+        if let Some(h) = args.get(i + 1).filter(|h| !h.trim().is_empty()) {
+            host = h.clone();
+        }
+    }
 
     let app = api::router();
-    let addr = format!("127.0.0.1:{port}");
+    let addr = format!("{host}:{port}");
     let listener = match tokio::net::TcpListener::bind(&addr).await {
         Ok(l) => l,
         Err(e) => {
-            eprintln!("启动失败: 端口 {port} 被占用或不可用（{e}）。可用 --port 指定其他端口。");
+            eprintln!("启动失败: {addr} 被占用或不可用（{e}）。可用 --host / --port 指定其他地址端口。");
             std::process::exit(1);
         }
     };
@@ -138,7 +151,8 @@ async fn serve(args: &[String]) {
     println!("webui: http://{addr}");
     println!("按 Ctrl+C 停止服务。");
 
-    let no_open = args.iter().any(|a| a == "--no-open");
+    let local_only = host == "127.0.0.1" || host == "localhost" || host == "::1";
+    let no_open = args.iter().any(|a| a == "--no-open") || !local_only;
     if !no_open {
         open_browser(&addr);
     }

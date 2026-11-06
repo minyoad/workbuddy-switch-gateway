@@ -1,0 +1,34 @@
+services:
+  wb-switch:
+    build:
+      context: .
+      args:
+        # 与桌面版一致的网关上游固定提交（见 README「从源码构建」）
+        GATEWAY_REF: cfb1713fb9f0692aa19aae7e7a6d6c2453235a38
+    image: wb-switch-gateway:latest
+    container_name: wb-switch
+    restart: unless-stopped
+    environment:
+      # 定时任务（09:00/21:00 签到、22:00 保活）按本地时区执行
+      TZ: Asia/Shanghai
+      # webui 访问密钥：设置后浏览器首次访问会要求在登录页输入；API 用
+      # `X-Api-Key: <key>` 或 `Authorization: Bearer <key>`。
+      # 远程部署强烈建议设置（账号 Token 全部经此服务存取）。
+      # 取值建议用 URL 安全字符（字母/数字/短横线），避免 ; = 空格。
+      #   启动前：export WB_SWITCH_API_KEY=你的密钥   或写入同目录 .env
+      WB_SWITCH_API_KEY: ${WB_SWITCH_API_KEY:-}
+    ports:
+      - "57890:57890" # webui 管理界面（建议用防火墙/安全组限制来源 IP）
+      - "7863:7863"   # OpenAI 兼容网关；若在 webui 内改端口，这里同步改
+    volumes:
+      - wb-switch-data:/root/.wb-switch
+    healthcheck:
+      # 不带 -f：只验证端口有 HTTP 应答（启用密钥后 /api/status 会 401，属正常）
+      test: ["CMD", "curl", "-s", "-o", "/dev/null", "http://127.0.0.1:57890/"]
+      interval: 60s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+volumes:
+  wb-switch-data:

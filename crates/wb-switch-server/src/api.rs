@@ -1,15 +1,17 @@
 //! HTTP API 层：把 wb-switch-core 暴露为本地 REST 接口，供 webui（浏览器）调用。
 //!
-//! 路由设计对应 Python 版 server.py 与桌面端 commands.rs。仅绑定 127.0.0.1，
-//! token 不出本机。
+//! 路由设计对应 Python 版 server.py 与桌面端 commands.rs。默认仅绑定 127.0.0.1，
+//! token 不出本机；远程部署（--host 0.0.0.0 + WB_SWITCH_API_KEY）时由
+//! `auth_middleware` 统一校验访问密钥。
 
 use std::sync::Mutex;
 #[cfg(target_os = "windows")]
 use std::time::{Duration, Instant};
 
 use axum::body::Body;
-use axum::extract::RawQuery;
+use axum::extract::{RawQuery, Request};
 use axum::http::{header, StatusCode, Uri};
+use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -52,6 +54,118 @@ struct Assets;
 /// 切换进度缓存：webui 通过 GET /api/switch/progress 轮询。
 static SWITCH_PROGRESS: Mutex<Option<String>> = Mutex::new(None);
 static SWITCH_RUNNING: Mutex<bool> = Mutex::new(false);
+
+/// 访问密钥（环境变量 WB_SWITCH_API_KEY，去空白后非空才启用鉴权）。
+/// 未启用时（本机模式）行为与旧版一致：不加任何校验。
+fn api_key() -> Option<&'static str> {
+    static KEY: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    KEY.get_or_init(|| {
+        std::env::var("WB_SWITCH_API_KEY")
+            .ok()
+            .map(|k| k.trim().to_owned())
+            .filter(|k| !k.is_empty())
+    })
+    .as_deref()
+}
+
+/// 浏览器登录后写入的 Cookie 名（供页面导航与静态资源请求携带密钥）。
+/// 因此访问密钥应使用不含 `;` `=` 空格等特殊字符的 URL 安全取值。
+const KEY_COOKIE: &str = "wb_switch_key";
+
+/// 请求是否携带正确密钥，三条通道任一命中即可：
+/// 1. `X-Api-Key: <key>`（前端 api.ts 的 XHR）
+/// 2. `Authorization: Bearer <key>`（脚本/第三方客户端）
+/// 3. Cookie `wb_switch_key=<key>`（浏览器导航与静态资源，由登录页写入）
+fn request_has_valid_key(req: &Request) -> bool {
+    let Some(expected) = api_key() else {
+        return true;
+    };
+    let matches = |value: &str| value.trim() == expected;
+    if let Some(v) = req.headers().get("x-api-key").and_then(|v| v.to_str().ok()) {
+        if matches(v) {
+            return true;
+        }
+    }
+    if let Some(v) = req
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+    {
+        if let Some(bearer) = v.strip_prefix("Bearer ") {
+            if matches(bearer) {
+                return true;
+            }
+        }
+    }
+    if let Some(cookie) = req.headers().get(header::COOKIE).and_then(|v| v.to_str().ok()) {
+        for part in cookie.split(';') {
+            if let Some((name, value)) = part.split_once('=') {
+                if name.trim() == KEY_COOKIE && matches(value) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// 浏览器导航（Accept 含 text/html）且无有效密钥时返回的内置登录页。
+/// 输入正确密钥后存入 localStorage，由前端 api.ts 统一附到后续请求上。
+const LOGIN_PAGE: &str = r#"<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>workbuddy-switch 访问验证</title>
+<style>body{font-family:system-ui,sans-serif;display:flex;min-height:100vh;align-items:center;justify-content:center;background:#0f1115;color:#e7e9ee}
+.card{background:#1a1d24;padding:2rem 2.5rem;border-radius:12px;width:min(360px,90vw)}
+input{width:100%;box-sizing:border-box;margin:.8rem 0;padding:.55rem .8rem;border-radius:8px;border:1px solid #3a3f4b;background:#0f1115;color:inherit;font-size:1rem}
+button{width:100%;padding:.55rem;border:0;border-radius:8px;background:#4f7cff;color:#fff;font-size:1rem;cursor:pointer}
+#msg{color:#ff7b72;min-height:1.2em;font-size:.9rem}</style></head>
+<body><div class="card"><h2 style="margin:0 0 .4rem">workbuddy-switch</h2><p style="margin:0;color:#9aa3b2;font-size:.9rem">该服务已启用访问密钥保护</p>
+<input id="k" type="password" placeholder="访问密钥" autofocus><button>进入</button><p id="msg"></p></div>
+<script>
+const KEY="wb_switch_api_key",COOKIE="wb_switch_key";
+async function go(){
+  const k=document.getElementById("k").value;
+  if(!k){document.getElementById("msg").textContent="请输入密钥";return}
+  try{const r=await fetch("/api/status",{headers:{"X-Api-Key":k}});
+    if(r.ok){
+      localStorage.setItem(KEY,k);
+      // Cookie 供页面导航与静态资源携带；XHR 仍用 X-Api-Key 头
+      document.cookie=COOKIE+"="+k+";path=/;max-age=2592000;SameSite=Lax";
+      location.replace("/");
+    }
+    else{document.getElementById("msg").textContent="密钥不正确"}
+  }catch(e){document.getElementById("msg").textContent="无法连接服务"}
+}
+document.querySelector("button").onclick=go;
+document.getElementById("k").addEventListener("keydown",e=>{if(e.key==="Enter")go()});
+</script></body></html>"#;
+
+/// 远程部署鉴权：设置 WB_SWITCH_API_KEY 后，所有请求都需携带密钥；
+/// 浏览器导航返回内置登录页，其余（API/静态资源）返回 401。
+async fn auth_middleware(req: Request, next: Next) -> Response {
+    if request_has_valid_key(&req) {
+        return next.run(req).await;
+    }
+    let wants_html = req
+        .headers()
+        .get(header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .map(|a| a.contains("text/html"))
+        .unwrap_or(false);
+    if wants_html {
+        Response::builder()
+            .status(StatusCode::UNAUTHORIZED)
+            .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+            .body(Body::from(LOGIN_PAGE))
+            .unwrap()
+    } else {
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "ok": false, "message": "缺少或错误的访问密钥（X-Api-Key / Authorization: Bearer）" })),
+        )
+            .into_response()
+    }
+}
 
 pub fn router() -> Router {
     Router::new()
@@ -120,6 +234,7 @@ pub fn router() -> Router {
             get(api_update_config).post(api_save_update_config),
         )
         .fallback(static_handler)
+        .layer(axum::middleware::from_fn(auth_middleware))
 }
 
 fn json_ok(v: Value) -> Response {

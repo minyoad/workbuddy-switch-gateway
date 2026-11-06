@@ -1,0 +1,26 @@
+# 构建上下文只保留 Rust server + 前端源码 + 网关补丁所需内容
+.git
+.github
+.trellis
+.codebuddy
+.agents
+.codex
+.vscode
+
+# 构建产物（镜像内重建）
+node_modules
+target
+dist
+**/target
+
+# 桌面版专属（仅保留 workspace manifest 以满足 cargo 元数据解析）
+src-tauri/*
+!src-tauri/Cargo.toml
+
+# 与镜像无关的目录
+docs
+npm
+scripts
+public/screenshots
+*.md
+!README.md
